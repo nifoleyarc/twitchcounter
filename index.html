@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Followers Counter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@700&display=swap" rel="stylesheet">
+<style>
+  /*
+    Виджет счётчика фолловеров Twitch для OBS.
+    Параметры URL (все необязательные):
+      ?channel=gensyxa   — канал
+      &goal=2000000      — цель, при достижении запускается салют
+      &interval=10       — как часто опрашивать DecAPI, в секундах (не меньше 10)
+      &test=1            — тестовый режим: фейковые данные рядом с целью, чтобы посмотреть анимацию и салют
+      &debug=1           — показать строку диагностики в углу
+    Ключи Twitch-приложения передаются ПОСЛЕ #, не в коде:
+      widget.html?channel=gensyxa#client_id=XXX&secret=YYY
+    Без ключей виджет берёт данные из DecAPI.
+  */
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Roboto', 'Segoe UI', Arial, sans-serif;
+  }
+
+  .pill {
+    --lh: 1.12em;
+    display: inline-flex;
+    align-items: center;
+    background: #fff;
+    color: #111;
+    border-radius: 999px;
+    padding: 0.1em 0.5em;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+    box-shadow: 0 0.04em 0.18em rgba(0,0,0,.18);
+    white-space: nowrap;
+    transform-origin: center;
+  }
+  .pill.win { animation: pulse 0.9s cubic-bezier(.3,1.6,.5,1) 3; }
+  @keyframes pulse {
+    0%   { transform: scale(1); }
+    40%  { transform: scale(1.08); }
+    100% { transform: scale(1); }
+  }
+
+  .digit {
+    display: inline-block;
+    height: var(--lh);
+    overflow: hidden;
+    position: relative;
+    /* мягкое затухание сверху и снизу, как у барабана */
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14%, #000 86%, transparent 100%);
+            mask-image: linear-gradient(to bottom, transparent 0, #000 14%, #000 86%, transparent 100%);
+  }
+  .strip {
+    display: flex;
+    flex-direction: column;
+    will-change: transform;
+    transition: transform 1.3s cubic-bezier(.22, 1, .36, 1);
+  }
+  .strip span {
+    display: block;
+    height: var(--lh);
+    line-height: var(--lh);
+    text-align: center;
+  }
+  .sep { display: inline-block; width: 0.24em; }
+
+  #confetti {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <div class="pill" id="pill"></div>
+  <canvas id="confetti"></canvas>
+
+<script>
+(() => {
+  const params   = new URLSearchParams(location.search);
+  const CHANNEL  = (params.get('channel') || 'gensyxa').trim();
+  const GOAL     = parseInt(params.get('goal') || '2000000', 10);
+  const INTERVAL = Math.max(10, parseInt(params.get('interval') || '10', 10)) * 1000;
+  const TEST     = params.get('test') === '1';
+  const DEBUG    = params.get('debug') === '1';
+
+  // ---------- Диагностика (?debug=1) ----------
+  let dbg = null;
+  if (DEBUG) {
+    dbg = document.createElement('div');
+    dbg.style.cssText = 'position:fixed;left:4px;bottom:2px;font:12px/1.3 monospace;color:#0f0;background:rgba(0,0,0,.75);padding:2px 6px;border-radius:4px;max-width:98vw;white-space:pre-wrap;z-index:9';
+    document.body.appendChild(dbg);
+  }
+  function log(msg) {
+    const t = new Date().toLocaleTimeString('ru-RU');
+    console.log(`[${t}] ${msg}`);
+    if (dbg) dbg.textContent = `[${t}] ${msg}`;
+  }
+
+  const pill = document.getElementById('pill');
+
+  // ---------- Барабанные цифры ----------
+  // Каждая цифра — лента 0-9 ×3. Рабочая позиция в средней трети (10..19),
+  // при переходе 9→0 крутим вперёд в третью треть и тихо возвращаемся в середину.
+  let cols = [];        // массив { strip, pos } слева направо
+  let current = null;   // текущее показанное число
+
+  function makeCol(startDigit) {
+    const wrap = document.createElement('span');
+    wrap.className = 'digit';
+    const strip = document.createElement('span');
+    strip.className = 'strip';
+    for (let k = 0; k < 30; k++) {
+      const s = document.createElement('span');
+      s.textContent = k % 10;
+      strip.appendChild(s);
+    }
+    wrap.appendChild(strip);
+    const col = { wrap, strip, pos: 10 + startDigit };
+    setPos(col, col.pos, false);
+    strip.addEventListener('transitionend', () => {
+      if (col.pos < 10 || col.pos > 19) {
+        setPos(col, 10 + (col.pos % 10), false);
+      }
+    });
+    return col;
+  }
+
+  function setPos(col, pos, animate) {
+    col.pos = pos;
+    if (!animate) {
+      col.strip.style.transition = 'none';
+      col.strip.style.transform = `translateY(${-pos * 100 / 30}%)`;
+      void col.strip.offsetHeight; // reflow
+      col.strip.style.transition = '';
+    } else {
+      col.strip.style.transform = `translateY(${-pos * 100 / 30}%)`;
+    }
+  }
+
+  function rebuild(len, prevStr) {
+    // Сохраняем старые цифры по позиции справа, чтобы при смене длины анимация шла от них
+    pill.innerHTML = '';
+    cols = [];
+    for (let i = 0; i < len; i++) {
+      const fromRight = len - 1 - i;
+      const prevIdx = prevStr ? prevStr.length - 1 - fromRight : -1;
+      const start = prevIdx >= 0 ? +prevStr[prevIdx] : 0;
+      if (i > 0 && (len - i) % 3 === 0) {
+        const sep = document.createElement('span');
+        sep.className = 'sep';
+        pill.appendChild(sep);
+      }
+      const col = makeCol(start);
+      pill.appendChild(col.wrap);
+      cols.push(col);
+    }
+    fit();
+  }
+
+  function render(value) {
+    const str = String(value);
+    const prevStr = current === null ? '0'.repeat(str.length) : String(current);
+    const goingUp = current === null || value >= current;
+
+    if (cols.length !== str.length) rebuild(str.length, prevStr);
+
+    // даём браузеру отрисовать стартовое положение, потом крутим
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      cols.forEach((col, i) => {
+        const target = +str[i];
+        const cur = col.pos % 10;
+        if (target === cur && col.pos >= 10 && col.pos <= 19) return;
+        let pos;
+        if (goingUp) pos = target >= cur ? 10 + target : 20 + target;
+        else         pos = target <= cur ? 10 + target : target;
+        // чтобы старший разряд не «перелетал» лишний круг после снапа
+        if (col.pos < 10 || col.pos > 19) setPos(col, 10 + cur, false);
+        setPos(col, pos, true);
+      });
+    }));
+
+    const crossed = current !== null && current < GOAL && value >= GOAL;
+    current = value;
+    if (crossed) celebrate();
+  }
+
+  // ---------- Подгон под размер источника OBS ----------
+  function fit() {
+    pill.style.fontSize = '100px';
+    const r = pill.getBoundingClientRect();
+    const scale = Math.min(innerWidth * 0.97 / r.width, innerHeight * 0.9 / r.height);
+    pill.style.fontSize = (100 * scale) + 'px';
+  }
+  addEventListener('resize', fit);
+  document.fonts && document.fonts.ready.then(fit);
+
+  // ---------- Данные ----------
+  // Ключи берутся из части адреса после # — она не уходит на сервер и не лежит в репозитории:
+  // widget.html#client_id=XXX&secret=YYY
+  const hash      = new URLSearchParams(location.hash.slice(1));
+  const CLIENT_ID = (hash.get('client_id') || '').trim();
+  const SECRET    = (hash.get('secret') || '').trim();
+  const HAS_KEYS  = !!(CLIENT_ID && SECRET);
+
+  let token = null, tokenExp = 0, broadcasterId = null;
+  const LS_KEY = 'twfc_token_' + CLIENT_ID;
+  try {
+    const saved = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
+    if (saved && saved.exp > Date.now() + 60000) { token = saved.token; tokenExp = saved.exp; }
+  } catch (_) {}
+
+  async function getToken(force) {
+    if (!force && token && tokenExp > Date.now() + 60000) return token;
+    // Тело как обычная форма и без своих заголовков — так браузер не делает preflight и Twitch отвечает
+    const res = await fetch('https://id.twitch.tv/oauth2/token', {
+      method: 'POST',
+      body: new URLSearchParams({ client_id: CLIENT_ID, client_secret: SECRET, grant_type: 'client_credentials' }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.access_token) throw new Error('токен: ' + (data.message || res.status));
+    token = data.access_token;
+    tokenExp = Date.now() + (data.expires_in || 3600) * 1000;
+    try { localStorage.setItem(LS_KEY, JSON.stringify({ token, exp: tokenExp })); } catch (_) {}
+    return token;
+  }
+
+  async function helix(path, retried) {
+    const t = await getToken(retried);
+    const res = await fetch('https://api.twitch.tv/helix/' + path, {
+      headers: { 'Authorization': 'Bearer ' + t, 'Client-Id': CLIENT_ID },
+      cache: 'no-store',
+    });
+    if (res.status === 401 && !retried) {   // токен протух или отозван — берём новый один раз
+      token = null;
+      try { localStorage.removeItem(LS_KEY); } catch (_) {}
+      return helix(path, true);
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`helix ${res.status}: ${data.message || ''}`);
+    return data;
+  }
+
+  async function fetchTwitch() {
+    if (!broadcasterId) {
+      const u = await helix('users?login=' + encodeURIComponent(CHANNEL.toLowerCase()));
+      if (!u.data || !u.data.length) throw new Error('канал не найден: ' + CHANNEL);
+      broadcasterId = u.data[0].id;
+    }
+    const f = await helix('channels/followers?first=1&broadcaster_id=' + broadcasterId);
+    if (typeof f.total !== 'number') throw new Error('нет поля total');
+    return f.total;
+  }
+
+  async function fetchDecapi() {
+    const res = await fetch(`https://decapi.me/twitch/followcount/${encodeURIComponent(CHANNEL)}`, { cache: 'no-store' });
+    const text = (await res.text()).trim();
+    const n = parseInt(text.replace(/[^\d]/g, ''), 10);
+    if (!res.ok || !/^\d[\d\s,.]*$/.test(text) || isNaN(n)) throw new Error('DecAPI: ' + text);
+    return n;
+  }
+
+  // Основной источник — официальный API, если он не ответил — запасной DecAPI
+  let lastSource = '';
+  async function fetchCount() {
+    if (HAS_KEYS) {
+      try { const n = await fetchTwitch(); lastSource = 'Twitch API'; return n; }
+      catch (e) {
+        const n = await fetchDecapi().catch(e2 => { throw new Error(`${e.message} | ${e2.message}`); });
+        lastSource = `DecAPI (Twitch: ${e.message})`;
+        return n;
+      }
+    }
+    const n = await fetchDecapi();
+    lastSource = 'DecAPI (ключи не заданы)';
+    return n;
+  }
+
+  async function tick() {
+    try {
+      const n = await fetchCount();
+      log(`ок: ${n}${n === current ? ' (без изменений)' : ''} · ${lastSource} · опрос раз в ${INTERVAL / 1000}с`);
+      if (n !== current) render(n);
+    } catch (e) {
+      // оставляем последнее значение, ничего не мигает
+      log(`ошибка: ${e && e.message ? e.message : e}`);
+    }
+  }
+
+  if (TEST) {
+    let fake = GOAL - 42;
+    render(fake);
+    setInterval(() => {
+      fake += Math.floor(Math.random() * 9) + 1;
+      render(fake);
+    }, 2200);
+  } else {
+    render(0);
+    tick();
+    setInterval(tick, INTERVAL);
+  }
+
+  // ---------- Салют ----------
+  const canvas = document.getElementById('confetti');
+  const ctx = canvas.getContext('2d');
+  const COLORS = ['#9146FF', '#FF4F9A', '#FFD23F', '#3DDC97', '#4FC3F7', '#FF7A45', '#ffffff'];
+  let parts = [];
+  let running = false;
+
+  function resizeCanvas() {
+    const dpr = devicePixelRatio || 1;
+    canvas.width = innerWidth * dpr;
+    canvas.height = innerHeight * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  resizeCanvas();
+  addEventListener('resize', resizeCanvas);
+
+  function spawn(x, y, count, angle, spread, speed) {
+    const base = Math.min(innerWidth, innerHeight);
+    for (let i = 0; i < count; i++) {
+      const a = angle + (Math.random() - 0.5) * spread;
+      const v = speed * base * (0.5 + Math.random() * 0.7);
+      parts.push({
+        x, y,
+        vx: Math.cos(a) * v,
+        vy: Math.sin(a) * v,
+        w: base * (0.025 + Math.random() * 0.03),
+        h: base * (0.012 + Math.random() * 0.016),
+        rot: Math.random() * Math.PI * 2,
+        vr: (Math.random() - 0.5) * 14,
+        flip: Math.random() * Math.PI * 2,
+        vf: 6 + Math.random() * 8,
+        color: COLORS[Math.random() * COLORS.length | 0],
+        round: Math.random() < 0.25,
+        life: 0,
+        ttl: 2.6 + Math.random() * 1.6,
+      });
+    }
+  }
+
+  function celebrate() {
+    pill.classList.remove('win');
+    void pill.offsetWidth;
+    pill.classList.add('win');
+
+    const W = innerWidth, H = innerHeight;
+    // пушки из нижних углов
+    spawn(0, H, 90, -Math.PI / 3, 0.9, 2.6);
+    spawn(W, H, 90, -Math.PI * 2 / 3, 0.9, 2.6);
+    // салюты-взрывы в случайных точках
+    let n = 0;
+    const fw = setInterval(() => {
+      spawn(W * (0.15 + Math.random() * 0.7), H * (0.15 + Math.random() * 0.5), 60, 0, Math.PI * 2, 1.4);
+      if (++n >= 7) clearInterval(fw);
+    }, 550);
+    setTimeout(() => {
+      spawn(0, H, 70, -Math.PI / 3, 0.9, 2.4);
+      spawn(W, H, 70, -Math.PI * 2 / 3, 0.9, 2.4);
+    }, 1800);
+
+    if (!running) { running = true; last = performance.now(); requestAnimationFrame(loop); }
+  }
+
+  let last = 0;
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    const g = Math.min(innerWidth, innerHeight) * 2.2;
+    ctx.clearRect(0, 0, innerWidth, innerHeight);
+
+    parts = parts.filter(p => p.life < p.ttl && p.y < innerHeight + 50);
+    for (const p of parts) {
+      p.life += dt;
+      p.vx *= 1 - 1.6 * dt;   // сопротивление воздуха
+      p.vy *= 1 - 1.6 * dt;
+      p.vy += g * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.rot += p.vr * dt;
+      p.flip += p.vf * dt;
+
+      const alpha = Math.min(1, (p.ttl - p.life) / 0.6);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.scale(1, Math.cos(p.flip));
+      ctx.fillStyle = p.color;
+      if (p.round) {
+        ctx.beginPath();
+        ctx.arc(0, 0, p.h * 0.8, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+      }
+      ctx.restore();
+    }
+
+    if (parts.length) requestAnimationFrame(loop);
+    else { running = false; ctx.clearRect(0, 0, innerWidth, innerHeight); }
+  }
+})();
+</script>
+</body>
+</html>
